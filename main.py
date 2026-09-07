@@ -1,3 +1,4 @@
+import base64
 import os
 import time
 
@@ -28,8 +29,61 @@ MODEL_PRICES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PERSONAS_FILE = os.path.join(BASE_DIR, "personas.txt")
 
-# 프로필 출력에서 제외할 필드(이름/이모지는 별도로 다룸)
-_HIDDEN_KEYS = {"이름", "이모지"}
+# 프로필 출력(시스템 프롬프트 포함)에서 제외할 필드 - 이름/이모지/이미지는
+# 코드에서 별도로 다루거나(이미지는 캐릭터 아바타로만 쓰임) 성격 묘사가 아니다.
+_HIDDEN_KEYS = {"이름", "이모지", "이미지"}
+
+# ==========================
+# 캐릭터 이미지
+# ==========================
+# 이미지 파일은 관리하기 쉽도록 main.py와 같은 위치의 "images" 폴더에 모아
+# 둔다. personas.txt의 "이미지:" 필드에는 이 폴더 안의 파일명만 적으면 된다
+# (예: 이미지: Comi_Idle.png → images/Comi_Idle.png 를 가리킴).
+IMAGES_DIR = os.path.join(BASE_DIR, "images")
+
+
+def get_persona_image_path(persona):
+    """personas.txt의 '이미지' 필드(파일명)를 images 폴더 기준 절대경로로
+    바꾼다. 필드가 없거나 파일이 실제로 없으면 None을 반환하고, 이 경우
+    호출하는 쪽에서 이모지 등으로 대체한다."""
+    image_name = persona.get("이미지")
+    if not image_name:
+        return None
+    image_path = os.path.join(IMAGES_DIR, image_name)
+    return image_path if os.path.exists(image_path) else None
+
+
+def set_chat_background(image_path):
+    """대화창(사이드바 제외) 뒤에 캐릭터 이미지를 배경으로 깔고, 그 위에
+    대화 내용이 겹쳐서 보이도록 CSS를 주입한다. 말풍선은 반투명하게 만들어
+    배경 이미지가 비치면서도 글자는 잘 읽히게 한다."""
+    ext = os.path.splitext(image_path)[1].lstrip(".").lower() or "png"
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
+
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stMainBlockContainer"] {{
+            background-image: url("data:image/{ext};base64,{img_b64}");
+            background-repeat: no-repeat;
+            background-position: center center;
+            background-size: min(60%, 420px) auto;
+        }}
+        [data-testid="stChatMessage"] {{
+            background-color: rgba(255, 255, 255, 0.82);
+            backdrop-filter: blur(2px);
+            border-radius: 12px;
+            max-width: 50%;
+            padding: 8px 12px;
+        }}
+        [data-testid="stChatInput"] {{
+            background-color: rgba(255, 255, 255, 0.9);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def load_personas(path=PERSONAS_FILE):
@@ -128,11 +182,13 @@ def select_persona():
     labels = [f"{PERSONAS[name].get('이모지', '')} {name}".strip() for name in persona_names]
     label_to_name = dict(zip(labels, persona_names))
 
-    selected_label = st.sidebar.radio("페르소나 선택:", labels)
+    selected_label = st.sidebar.radio("대화방 선택 (페르소나):", labels)
     persona_name = label_to_name[selected_label]
     st.session_state.persona_name = persona_name
+    st.sidebar.caption("페르소나마다 대화 기록이 따로 유지되는 별도의 대화방입니다.")
 
     persona = PERSONAS[persona_name]
+
     st.sidebar.markdown(f"### {persona.get('이모지', '')} {persona_name}")
     if GROUP_INFO.get("이름"):
         st.sidebar.markdown(f"- 그룹: {GROUP_INFO['이름']}")
@@ -149,15 +205,21 @@ def init_page():
     st.sidebar.title("Options")
 
 
-def init_messages():
-    clear_button = st.sidebar.button("Clear Conversation", key="clear")
-    if clear_button or "message_history" not in st.session_state:
-        st.session_state.message_history = []
-        st.session_state.last_activity_time = time.time()
+def init_messages(persona_name):
+    """
+    페르소나별로 독립된 대화방을 만든다. message_histories/last_activity_times는
+    {페르소나이름: ...} 형태로 저장되며, 페르소나를 바꿔도 서로의 대화 기록에
+    영향을 주지 않는다.
+    """
+    if "message_histories" not in st.session_state:
+        st.session_state.message_histories = {}
+    if "last_activity_times" not in st.session_state:
+        st.session_state.last_activity_times = {}
 
-    # 세션이 처음 시작됐을 때도 침묵 타이머를 세팅해 둔다.
-    if "last_activity_time" not in st.session_state:
-        st.session_state.last_activity_time = time.time()
+    clear_button = st.sidebar.button("이 대화방 초기화", key="clear")
+    if clear_button or persona_name not in st.session_state.message_histories:
+        st.session_state.message_histories[persona_name] = []
+        st.session_state.last_activity_times[persona_name] = time.time()
 
 
 # ==========================
@@ -196,25 +258,28 @@ def init_silence_settings():
 
 
 @st.fragment(run_every=2)
-def check_silence_and_speak(chain):
+def check_silence_and_speak(chain, persona_name):
     """
-    2초마다 조용히 깨어나서 침묵 시간이 지났는지 확인하고, 지났다면 AI가
-    먼저 메시지를 보낸다. 화면에는 아무것도 그리지 않다가, 실제로 먼저
-    말을 걸었을 때만 st.rerun()으로 전체 화면을 새로고침한다.
+    2초마다 조용히 깨어나서, 현재 열려 있는 (persona_name) 대화방이 침묵
+    시간을 넘겼는지 확인하고, 넘겼다면 그 페르소나가 먼저 메시지를 보낸다.
+    다른 페르소나의 대화방에는 영향을 주지 않는다. 화면에는 아무것도 그리지
+    않다가, 실제로 먼저 말을 걸었을 때만 st.rerun()으로 새로고침한다.
     """
     if not st.session_state.get("proactive_enabled", True):
         return
 
+    history = st.session_state.message_histories.setdefault(persona_name, [])
+    last_time = st.session_state.last_activity_times.setdefault(persona_name, time.time())
+
     silence_seconds = st.session_state.get("silence_seconds", 30)
-    elapsed = time.time() - st.session_state.last_activity_time
+    elapsed = time.time() - last_time
     if elapsed < silence_seconds:
         return
 
-    # 다음 침묵 구간을 위해 타이머를 리셋한다.
-    st.session_state.last_activity_time = time.time()
+    # 이 대화방의 다음 침묵 구간을 위해 타이머를 리셋한다.
+    st.session_state.last_activity_times[persona_name] = time.time()
 
-    persona_name = st.session_state.get("persona_name", "")
-    is_empty = not st.session_state.get("message_history")
+    is_empty = not history
     prompt_template = (
         PROACTIVE_TRIGGER_PROMPT_OPEN if is_empty else PROACTIVE_TRIGGER_PROMPT_CONTINUE
     )
@@ -223,7 +288,7 @@ def check_silence_and_speak(chain):
     try:
         response = chain.invoke(
             {
-                "history": st.session_state.message_history,
+                "history": history,
                 "user_input": trigger_text,
             }
         )
@@ -233,11 +298,13 @@ def check_silence_and_speak(chain):
         # 화면에 반영되지 않는다(프래그먼트가 자기 컨테이너 밖에는 그릴 수
         # 없기 때문). 그래서 실패하면 반드시 보이는 st.toast()로 알리고,
         # 서버 콘솔(터미널)에도 에러를 남긴다.
-        print(f"[먼저 말 걸기] chain.invoke 실패: {type(e).__name__}: {e}")
-        st.toast(f"먼저 말 걸기 실패: {e}", icon="⚠️")
+        print(f"[먼저 말 걸기:{persona_name}] chain.invoke 실패: {type(e).__name__}: {e}")
+        st.toast(f"({persona_name}) 먼저 말 걸기 실패: {e}", icon="⚠️")
         return
 
-    st.session_state.message_history.append({"role": "assistant", "content": response})
+    st.session_state.message_histories[persona_name].append(
+        {"role": "assistant", "content": response}
+    )
     st.rerun()
 
 
@@ -260,9 +327,8 @@ def select_model():
     )
 
 
-def init_chain():
+def init_chain(persona_name):
     st.session_state.llm = select_model()
-    persona_name = select_persona()
     system_prompt = build_system_prompt(persona_name)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -282,18 +348,20 @@ def get_message_counts(text):
     return len(encoding.encode(text))
 
 
-def calc_and_display_costs():
+def calc_and_display_costs(persona_name):
+    history = st.session_state.message_histories.get(persona_name, [])
+
     output_count = 0
     input_count = 0
 
-    for msg in st.session_state.message_history:
+    for msg in history:
         token_count = get_message_counts(msg["content"])
         if msg["role"] == "assistant":
             output_count += token_count
         else:
             input_count += token_count
 
-    if not st.session_state.message_history:
+    if not history:
         return
 
     cost_input = MODEL_PRICES["input"][st.session_state.model_name] * input_count
@@ -301,43 +369,112 @@ def calc_and_display_costs():
     cost = cost_input + cost_output
 
     st.sidebar.markdown("## Costs")
-    st.sidebar.markdown(f"**Total cost: ${cost:.5f}**")
+    st.sidebar.markdown(f"**Total cost: ${cost:.5f}** (이 대화방 기준)")
     st.sidebar.markdown(f"- Input cost: ${cost_input:.5f}")
     st.sidebar.markdown(f"- Output cost: ${cost_output:.5f}")
 
 
 def main():
     init_page()
-    init_messages()
-    chain = init_chain()
+
+    # 먼저 어느 페르소나(=어느 대화방)인지 정한 다음, 그 방의 대화 기록/타이머를
+    # 준비하고, 그 페르소나 기준으로 체인을 만든다.
+    persona_name = select_persona()
+    init_messages(persona_name)
+    chain = init_chain(persona_name)
     init_silence_settings()
 
-    for msg in st.session_state.message_history:
-        st.chat_message(msg["role"]).markdown(msg["content"])
+    history = st.session_state.message_histories[persona_name]
 
-    if user_input := st.chat_input("궁금한 내용을 입력해주세요."):
-        st.session_state.message_history.append({"role": "user", "content": user_input})
-        st.session_state.last_activity_time = time.time()
-        st.chat_message("user").markdown(user_input)
+    # 캐릭터 이미지가 있으면 아바타로, 없으면 이모지로 대체한다.
+    persona = PERSONAS[persona_name]
+    persona_image_path = get_persona_image_path(persona)
+    assistant_avatar = persona_image_path or persona.get("이모지") or "🤖"
 
-        with st.chat_message("assistant"):
-            response = st.write_stream(
-                chain.stream(
-                    {
-                        "history": st.session_state.message_history,
-                        "user_input": user_input,
-                    }
+    # 캐릭터의 Idle 이미지를 대화창 뒤 배경으로 깔아서 대화 내용과 겹쳐 보이게 한다.
+    if persona_image_path:
+        set_chat_background(persona_image_path)
+
+    # 대화 영역이 입력창 바로 위까지 꽉 채워지도록, 화면 스크롤 영역부터
+    # 대화 영역까지 이어지는 컨테이너들을 전부 flex column으로 맞춘다.
+    # 이렇게 해야 대화 영역이 남는 공간을 전부 차지해서 입력창과 딱 붙는다.
+    # 메시지가 적을 때는 아래쪽(입력창 쪽)에 몰리고, 많아지면 이 영역 안에서만
+    # 스크롤된다.
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"] > div:last-child {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        [data-testid="stAppScrollToBottomContainer"] > div:empty {
+            flex: 0 0 0 !important;
+            height: 0 !important;
+            min-height: 0 !important;
+        }
+        [data-testid="stMainBlockContainer"] {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            min-height: 0;
+        }
+        [data-testid="stMainBlockContainer"] [data-testid="stVerticalBlock"]:has(.st-key-chat_messages),
+        [data-testid="stMainBlockContainer"] [data-testid="stLayoutWrapper"]:has(.st-key-chat_messages) {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            min-height: 0;
+        }
+        .st-key-chat_messages {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            justify-content: flex-end;
+        }
+        /* 사용자 메시지는 왼쪽, AI(캐릭터) 메시지는 오른쪽에 배치한다.
+           사용자 메시지는 기본 아바타(stChatMessageAvatarUser)를 쓰므로
+           이걸로 구분하고, 그 외(=AI 메시지)는 반대쪽으로 보낸다. */
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+            align-self: flex-start;
+        }
+        [data-testid="stChatMessage"]:not(:has([data-testid="stChatMessageAvatarUser"])) {
+            align-self: flex-end;
+            flex-direction: row-reverse;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    chat_area = st.container(height="content", key="chat_messages")
+    with chat_area:
+        for msg in history:
+            avatar = assistant_avatar if msg["role"] == "assistant" else None
+            st.chat_message(msg["role"], avatar=avatar).markdown(msg["content"])
+
+    if user_input := st.chat_input(f"{persona_name}에게 메시지 보내기..."):
+        history.append({"role": "user", "content": user_input})
+        st.session_state.last_activity_times[persona_name] = time.time()
+
+        with chat_area:
+            st.chat_message("user").markdown(user_input)
+
+            with st.chat_message("assistant", avatar=assistant_avatar):
+                response = st.write_stream(
+                    chain.stream(
+                        {
+                            "history": history,
+                            "user_input": user_input,
+                        }
+                    )
                 )
-            )
 
-        st.session_state.message_history.append(
-            {"role": "assistant", "content": response}
-        )
-        st.session_state.last_activity_time = time.time()
-    calc_and_display_costs()
+        history.append({"role": "assistant", "content": response})
+        st.session_state.last_activity_times[persona_name] = time.time()
+    calc_and_display_costs(persona_name)
 
-    # 서로 계속 조용하면 AI가 먼저 말을 건다.
-    check_silence_and_speak(chain)
+    # 이 대화방이 계속 조용하면 이 페르소나가 먼저 말을 건다.
+    check_silence_and_speak(chain, persona_name)
 
 
 if __name__ == "__main__":
